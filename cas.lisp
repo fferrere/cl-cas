@@ -2,39 +2,104 @@
 
 ;; https://calnetweb.berkeley.edu/calnet-technologists/cas/how-cas-works
 
-;; CAS Protocol V2 Specification Only
+;; CAS Protocol V2 Specification
 
-(defclass cas-client ()
-  ((server-url :accessor cas-serveur-url
-               :initarg :server-url)
-   (renew :accessor cas-renew
-          :initarg :renew
-          :initform '())))
+(define-condition cas-error (error)
+  ((message :initarg :message
+            :reader message))
+  (:report (lambda (condition stream)
+             (format stream "~a" (message condition)))))
 
-(defun format-url (server-url uri &key service-url suffix)
-  (format nil "~A~A~@[~A~]" (string-right-trim '(#\/) server-url) uri
-          (if service-url (format nil "?service=~A~@[~A~]" (quri:url-encode service-url) suffix) "")))
+(define-condition cas-url-invalid-parameters-error (cas-error) ())
 
-(defmethod cas-login-url ((cas cas-client) url)
-  (format-url (cas-serveur-url cas) "/login" :service-url url))
+(define-condition cas-invalid-request-error (cas-error) ()
+  (:documentation "INVALID_REQUEST - not all of the required request parameters were present"))
+(define-condition cas-invalid-ticket-error (cas-error) ()
+  (:documentation "INVALID_TICKET - the ticket provided was not valid, or the ticket did not come from an initial login and “renew” was set on validation."))
+(define-condition cas-invalid-service-error (cas-error) ()
+  (:documentation "INVALID_SERVICE - the ticket provided was valid, but the service specified did not match the service associated with the ticket."))
+(define-condition cas-internal-error (cas-error) ()
+  (:documentation "INTERNAL_ERROR - an internal error occurred during ticket validation"))
 
-(defmethod cas-logout-url ((cas cas-client) &optional redirect-url)
-  (format-url (cas-serveur-url cas) (format nil "/logout~@[~a~]"
-                                            (when redirect-url
-                                              (format nil "?url=~a" (quri:url-encode redirect-url))))))
+(defun concatenate-url-path (path-base path)
+  (ppcre:regex-replace-all "/+"
+			   (format nil "/~@[~a/~]~@[~a~]"
+				   (and path-base (string-trim '(#\/) path-base)) 
+				   (and path (string-trim '(#\/) path)))
+			   "/"))
+
+(defun format-url (cas-server-url path &key query)
+  (let ((uri (quri:uri cas-server-url)))
+    (quri:render-uri (quri:make-uri :defaults uri
+				    :path (concatenate-url-path (quri:uri-path uri) path)
+				    :query query))))
+
+(defun cas-login-url (cas-server-url &key service-url renew gateway)
+  "Return a CAS Login URL
+   Renew : nil (default) or true
+   Gateway : nil (default) or true
+   Renew and Gateway are mutually exclusive"
+  (declare (type boolean gateway renew))
+  (and renew gateway (error 'cas-url-invalid-parameters-error
+                            :message "renew and gateway are mutually exclusive"))
+  (let ((query (when service-url
+                 (format nil "service=~a~@[~a~]" (quri:url-encode service-url)
+                         (cond
+                           (renew "&renew=true")
+                           (gateway "&gateway=true"))))))
+    (format-url cas-server-url "/login" :query query)))
+
+(defun cas-logout-url (cas-server-url &key url)
+  (let ((query (when url (format nil "url=~a" url))))
+   (format-url cas-server-url "/logout" :query query)))
       
+(defun cas-validate-url (cas-server-url service-url ticket &key renew)
+  (let ((query (format nil "service=~a&ticket=~a~@[~a~]"
+                       (quri:url-encode service-url)
+                       ticket
+                       (when renew "&renew=true"))))
+    (format-url cas-server-url "/validate" :query query)))
 
-(defmethod cas-validate-url ((cas cas-client) service-url ticket)
-  (format-url (cas-serveur-url cas) "/validate" :service-url service-url
-              :suffix (format nil "&ticket=~a~a" ticket (if (cas-renew cas) "&renew=true" ""))))
+(defun pgt-url-p (pgt-url)
+  "Check if pgt-url is a valid Proxy CAS URL, i.e. only https"
+  (string= "https" (quri:uri-scheme (quri:uri pgt-url))))
 
-(defmethod cas-service-validate-url ((cas cas-client) service-url ticket format)
-  (format-url (cas-serveur-url cas) "/serviceValidate" :service-url service-url
-              :suffix (format nil  "&ticket=~a~a~a" ticket
-                              (if (cas-renew cas) "&renew=true" "")
-                              (if (eq format :json) "&format=json" ""))))
+(defun cas-service-validate-url (cas-server-url service-url ticket &key pgt-url renew (format :xml))
+  (let ((query (format nil "service=~a&ticket=~a~@[~a~]~@[~a~]~@[~a~]"
+                       (quri:url-encode service-url)
+                       ticket
+                       (when pgt-url
+                         (if (pgt-url-p pgt-url)
+                             (format nil "&pgtUrl=~a" (quri:url-encode pgt-url))
+                             (error 'cas-url-invalid-parameters-error :message
+                              (format nil "PGT URL MUST be HTTPS : ~a" pgt-url))))
+                       (when renew "&renew=true")
+                       (when (eql format :json) "&format=json"))))
+    (format-url cas-server-url "/serviceValidate" :query query)))
+
+(defun cas-proxy-validate-url (cas-server-url service-url ticket &key pgt-url renew (format :xml))
+  (let ((query (format nil "service=~a&ticket=~a~@[~a~]~@[~a~]~@[~a~]"
+                       (quri:url-encode service-url)
+                       ticket
+                       (when pgt-url
+                         (if (pgt-url-p pgt-url)
+                             (format nil "&pgtUrl=~a" (quri:url-encode pgt-url))
+                             (error 'cas-url-invalid-parameters-error :message
+                                    (format nil "This URL MUST be HTTPS : ~a" pgt-url))))
+                       (when renew "&renew=true")
+                       (when (eql format :json) "&format=json"))))
+    (format-url cas-server-url "/proxyValidate" :query query)))
+
+(defun cas-proxy-url (cas-server-url target-service pgt)
+  (let ((query (format nil "targetService=~a&pgt=~a"
+                       (quri:url-encode target-service)
+                       pgt)))
+    (format-url cas-server-url "/proxy" :query query)))
 
 
+;;
+;; CAS Response management functions
+;;
 (defun cas-response-xml-attributes (response-success-node)
   (when-let ((attributes (xmls:xmlrep-find-child-tag "attributes" response-success-node '())))
       (loop for node in (xmls:node-children attributes)
@@ -53,13 +118,34 @@
 (defun cas-response-xml-user (response-success-node)
   (xmls:node-children (xmls:xmlrep-find-child-tag "user" response-success-node)))
 
-(defun cas-response-xml-success (response)
-  (when-let ((user-node (xmls:xmlrep-find-child-tag "authenticationSuccess" (xmls:parse response) '())))
-    (values (car (cas-response-xml-user user-node)) (cas-response-xml-attributes user-node))))
+(defun cas-response-xml-pgt (response-success-node)
+  (handler-case
+      (car (xmls:node-children (xmls:xmlrep-find-child-tag "proxyGrantingTicket" response-success-node)))
+    (error () ())))
+
+(defun cas-response-xml-proxies (response-success-node)
+  (handler-case
+      (loop for node in (xmls:node-children (xmls:xmlrep-find-child-tag "proxies" response-success-node))
+            collect (car (xmls:node-children node)))
+    (error () ())))
 
 (defun cas-response-xml-success (response)
   (when-let ((user-node (xmls:xmlrep-find-child-tag "authenticationSuccess" (xmls:parse response) '())))
-    (values (car (cas-response-xml-user user-node)) (cas-response-xml-attributes user-node))))
+    (values (car (cas-response-xml-user user-node))
+            (cas-response-xml-attributes user-node)
+            (cas-response-xml-pgt user-node)
+            (cas-response-xml-proxies user-node))))
+
+(defun cas-proxy-response-xml-ticket (response-success-node)
+  (xmls:node-children (xmls:xmlrep-find-child-tag "proxyTicket" response-success-node)))
+
+(defun cas-proxy-response-xml-success (response)
+  (when-let ((node (xmls:xmlrep-find-child-tag "proxySuccess" (xmls:parse response) '())))
+    (car (cas-proxy-response-xml-ticket node))))
+
+(defun cas-proxy-response-json-success (response)
+  (declare (ignore response))
+  (error "JSON format not yet implemented"))
 
 (defun cas-response-json-attributes (response-success-node)
   (cdr (assoc :attributes response-success-node)))
@@ -87,29 +173,32 @@
   (when-let ((user-node (cdr (assoc :authentication-success (cdar (cas-decode-json response))))))
     (values (cas-response-json-user user-node) (cas-response-json-attributes user-node))))
 
-(defmethod cas-validate ((cas cas-client) service-url ticket)
+;;
+;; CAS Validate Functions
+;;
+(defun cas-validate (cas-server-url service-url ticket)
   "CAS v1. Verify with CAS that 'ticket' is a legitimate ticket. If so, return username"
-  (let* ((url (cas-validate-url cas service-url ticket))
+  (let* ((url (cas-validate-url cas-server-url service-url ticket))
          (response (babel:octets-to-string (dex:get url :force-binary t))))
     (when (string= (subseq response 0 3) "yes")
       (string-trim '(#\Newline) (subseq response 4)))))
 
-(defmethod cas-service-validate ((cas cas-client) service-url ticket &key pgt-url (format :xml))
+(defun cas-service-validate (cas-server-url service-url ticket &key pgt-url renew (format :xml))
   "Verify with CAS that 'ticket' is a legitimate ticket. Return cas username and its attribues, false elsewhere.
 
    From Apereo CAS documention :
        - pgtUrl [OPTIONAL] - the URL of the proxy callback. Discussed in Section 2.5.4. As a HTTP request parameter, the “pgtUrl” value MUST be URL-encoded as described in Section 2.2 of RFC 1738 [4].
        - renew [OPTIONAL] - if this parameter is set, ticket validation will only succeed if the service ticket was issued from the presentation of the user’s primary credentials. It will fail if the ticket was issued from a single sign-on session.
        - format [OPTIONAL] - if this parameter is set, ticket validation response MUST be produced based on the parameter value. Supported values are XML and JSON. If this parameter is not set, the default XML format will be used."
-  (declare (ignore pgt-url))
-  (let ((url (cas-service-validate-url cas service-url ticket format))
+  (let ((url (cas-service-validate-url cas-server-url service-url ticket
+                                       :format format :renew renew :pgt-url pgt-url))
         (headers '(("Accept" . "application/xml, application/json"))))
     (multiple-value-bind (body status response-headers)
         (dex:get url :headers headers)
       (declare (ignore status))
       (if (ppcre:scan "application/json" (gethash "content-type" response-headers ))
-         (cas-response-json-success body)
-         (cas-response-xml-success body)))))
+          (cas-response-json-success body)
+          (cas-response-xml-success body)))))
 
 (defun cas-ticket (query-string)
   "Return the value of the HTTP query-string 'ticket' parameter as CAS Ticket, if exists"
@@ -117,8 +206,28 @@
               (quri:url-decode-params query-string)
               :test #'string-equal)))
 
-;; todo
+;;
+;; CAS Proxy functions 
+;;
 
-(defun cas-proxy ())
+(defun cas-proxy (cas-server-url target-service pgt)
+  (let ((url (cas-proxy-url cas-server-url target-service pgt))
+        (headers '(("Accept" . "application/xml, application/json"))))
+    (multiple-value-bind (body status response-headers)
+        (dex:get url :headers headers)
+      (declare (ignore status))
+      (if (ppcre:scan "application/json" (gethash "content-type" response-headers ))
+          (cas-proxy-response-json-success body)
+          (cas-proxy-response-xml-success body)))))
 
-(defun cas-proxy-validate ())
+(defun cas-proxy-validate (cas-server-url service-url ticket &key pgt-url renew (format :xml))
+  "Verify with CAS that 'ticket' is a legitimate ticket. Return cas username and its attribues, false elsewhere."
+  (let ((url (cas-proxy-validate-url cas-server-url service-url ticket
+                                     :format format :renew renew :pgt-url pgt-url))
+        (headers '(("Accept" . "application/xml, application/json"))))
+    (multiple-value-bind (body status response-headers)
+        (dex:get url :headers headers)
+      (declare (ignore status))
+      (if (ppcre:scan "application/json" (gethash "content-type" response-headers ))
+          (cas-response-json-success body)
+          (cas-response-xml-success body)))))
